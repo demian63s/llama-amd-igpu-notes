@@ -72,6 +72,8 @@ modelo. Resultados frente a un `master` limpio, medidos de forma intercalada el 
 | MoE 35B-A3B | **+8-9 %** (30,0/30,5 → 32,8/32,9 t/s) | **+5,5-6,3 %** (248,6/244,7 → 264,2/258,0 t/s) |
 | Denso 27B | **+4,6 %** (6,28 → 6,57 t/s) | sin cambio (~72 t/s) |
 | MoE, con el cambio 5 (wave32 de iq3_xxs, añadido después de estas medidas) | otro **+2 %** (36,0 → 36,8 t/s) | n/a |
+| MoE, con el cambio 6 (fusión C, añadida después; frente al mismo binario sin ella) | otro **+2,1 %** (36,8 → 37,5 t/s) | sin cambio |
+| Denso 27B, con el cambio 6 | +0,4 % (dentro del ruido) | n/a |
 
 El 20-oct, con la máquina más rápida, el conjunto dio ~+10 % de generación sin MTP y +11-12 % de prompt en el MoE.
 Con MTP la ganancia de los parches es menor (+4,4 % medido con MoE, `n-max 1`).
@@ -92,7 +94,8 @@ cmake --build build -j
 
 El parche se verificó con `git apply --check` sobre un `9df0b73c7` limpio. En commits posteriores puede necesitar ajustes.
 `patches/experimental-mtp-rollback-identity.patch` es el mismo conjunto **más** un experimento descartado (ver
-"Lo que no funcionó"); no lo recomiendo.
+"Lo que no funcionó"); no lo recomiendo. Ese parche **no incluye la fusión C** (cambio 6): es el conjunto anterior, y
+aplicar los dos a la vez no está probado.
 
 Scripts en `scripts/` (todos parametrizados con variables de entorno, sin rutas personales):
 
@@ -191,6 +194,7 @@ tokens cuesta ~1,39× un token (los expertos pasan de ~6,3 a ~10,6 ms) y el paso
 | 3 | **Fusión A:** `GATED_DELTA_NET` + el `CPY` que escribe el estado recurrente: el shader escribe directo en la caché | `gated_delta_net.comp` + patrón de fusión | `CPY` 60 → 30 por token; tg +3,5-5 % |
 | 4 | **Fusión B:** si la copia de estado (`GET_ROWS`) es una identidad (una secuencia, sin reversión, sin estado nuevo), `build_rs` devuelve una **vista** de la caché | `llama-graph.cpp`, `llama-memory-recurrent.cpp` | `GET_ROWS` 62 → 2 por token; tg +5 %. **Solo si la caché está en buffers Vulkan** (no se pudieron probar otros backends) |
 | 5 | `MUL_MAT_ID_VEC` de iq3_xxs con `k <= 512` como un único grupo de 32 hilos (wave32) | `ggml-vulkan.cpp` | kernel 65,5 → 50,8 µs (−22 %); tg MoE +2 % |
+| 6 | **Fusión C:** `CONCAT`(estado de convolución, qkv) + `SSM_CONV` + `SILU` + el `CPY` que guarda el nuevo estado de convolución, en **un solo dispatch**: el shader lee estado y qkv sin materializar el concat y escribe el estado nuevo en la caché | `ssm_conv.comp` (variante `FUSE_CONV_CPY`), `ggml-vulkan.cpp` | `CONCAT`+`CPY`+`SSM_CONV_SILU` 18,5 → 6,15 µs por capa recurrente; tg MoE +2,1 %, denso +0,4 % (ruido). Solo con 1 token por secuencia, kernel de ancho 4, F32 y sin MTP |
 
 Detalles y trampas:
 
@@ -199,6 +203,13 @@ Detalles y trampas:
   de solapamiento de Vulkan).
 - El cambio 5 reutiliza la ranura de pipeline `DMMV_WG_SIZE_LARGE`, que en AMD nunca se selecciona; es un atajo
   comentado en el código. Una versión limpia añadiría un campo propio. Solo medido en RDNA3.
+- Fusión C: los seis nodos (`CONCAT`, dos `VIEW`, `CPY`, `SSM_CONV`, `SILU`) **no son contiguos** en el grafo del modelo,
+  porque `build_conv_state` expande el `CPY` antes de crear el `SSM_CONV`. El optimizador de grafos de Vulkan los agrupa
+  (y fija una dependencia de asignación para que la salida del `SILU` no pise el qkv). Ese optimizador solo lo llama el
+  planificador, no `test-backend-ops`, así que el test (`SSM_CONV_CONCAT_CPY`) construye un grafo con los nodos ya juntos.
+- Fusión C: con una suma secuencial en el shader el texto divergía a temperatura 0 por el orden de las sumas en fp32; con
+  el mismo `dot` de 4 elementos que usa el kernel sin fusionar, el texto sale **idéntico** (MoE 150 tokens, denso 60).
+  Es otro ejemplo de por qué conviene calcular igual que el kernel original (ver "Metodología").
 - No hay prueba unitaria que cubra `build_rs`; la verificación es de extremo a extremo.
 
 ### 6. Lo que no funcionó (para no repetirlo)
@@ -225,6 +236,10 @@ Detalles y trampas:
 | Misma predicción más probable | 100,000 % | 100,000 % |
 | HellaSwag (400 tareas) | 80,75 % → 80,75 % | 81,00 % → 81,00 % |
 | Winogrande (500 tareas) | 73,20 ± 1,98 → igual | 77,00 ± 1,88 → igual |
+
+Esta tabla se midió con los cambios 1-5. La fusión C (cambio 6) se añadió después y solo se volvió a medir en el MoE,
+perplexity y KL-divergence: perplexity 7,0841 → 7,0841, KL media ≈ 0, máximo 5,6e-5, misma predicción más probable
+100,000 %. HellaSwag y Winogrande no se repitieron con ella, y en el denso solo se comparó texto a temperatura 0.
 
 Los valores mínimos de KL salen ligeramente negativos por la cuantización del fichero de referencia (ruido, no un error).
 Con 400-500 tareas el error es de ~2 puntos: estas pruebas confirman que los parches no alteran el modelo, pero **no
@@ -254,8 +269,8 @@ dentro del error combinado).
 - Las demás arquitecturas recurrentes que comparten `build_rs` (mamba, rwkv, jamba, kimi…) solo se probaron con pesos
   aleatorios (`test-llama-archs`), no con modelos reales. Los demás backends (CUDA, Metal…) quedan **desactivados** para
   la fusión B por no poder probarse.
-- Pruebas unitarias ejecutadas: `test-backend-ops` (`MUL_MAT_ID`, `MUL_MAT`, `GATED_DELTA_NET*`, `CPY`, `GET_ROWS`) y
-  `test-llama-archs`, todas correctas.
+- Pruebas unitarias ejecutadas: `test-backend-ops` (`MUL_MAT_ID`, `MUL_MAT`, `GATED_DELTA_NET*`, `CPY`, `GET_ROWS`,
+  `CONCAT`, `SSM_CONV*` y el nuevo `SSM_CONV_CONCAT_CPY`) y `test-llama-archs`, todas correctas.
 - Estimaciones marcadas como tales en el texto no se midieron.
 
 ## Créditos
