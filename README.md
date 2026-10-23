@@ -74,6 +74,7 @@ modelo. Resultados frente a un `master` limpio, medidos de forma intercalada el 
 | MoE, con el cambio 5 (wave32 de iq3_xxs, añadido después de estas medidas) | otro **+2 %** (36,0 → 36,8 t/s) | n/a |
 | MoE, con el cambio 6 (fusión C, añadida después; frente al mismo binario sin ella) | otro **+2,1 %** (36,8 → 37,5 t/s) | sin cambio |
 | Denso 27B, con el cambio 6 | +0,4 % (dentro del ruido) | n/a |
+| MoE, con el cambio 7 (producto entero para iq2_xs; frente al mismo binario sin él) | otro **+1,5 %** (37,15 → 37,71 t/s) | sin cambio |
 
 El 20-oct, con la máquina más rápida, el conjunto dio ~+10 % de generación sin MTP y +11-12 % de prompt en el MoE.
 Con MTP la ganancia de los parches es menor (+4,4 % medido con MoE, `n-max 1`).
@@ -94,8 +95,8 @@ cmake --build build -j
 
 El parche se verificó con `git apply --check` sobre un `9df0b73c7` limpio. En commits posteriores puede necesitar ajustes.
 `patches/experimental-mtp-rollback-identity.patch` es el mismo conjunto **más** un experimento descartado (ver
-"Lo que no funcionó"); no lo recomiendo. Ese parche **no incluye la fusión C** (cambio 6): es el conjunto anterior, y
-aplicar los dos a la vez no está probado.
+"Lo que no funcionó"); no lo recomiendo. Ese parche **no incluye los cambios 6 y 7** (fusión C e iq2_xs entero): es el
+conjunto anterior, y aplicar los dos a la vez no está probado.
 
 Scripts en `scripts/` (todos parametrizados con variables de entorno, sin rutas personales):
 
@@ -195,6 +196,7 @@ tokens cuesta ~1,39× un token (los expertos pasan de ~6,3 a ~10,6 ms) y el paso
 | 4 | **Fusión B:** si la copia de estado (`GET_ROWS`) es una identidad (una secuencia, sin reversión, sin estado nuevo), `build_rs` devuelve una **vista** de la caché | `llama-graph.cpp`, `llama-memory-recurrent.cpp` | `GET_ROWS` 62 → 2 por token; tg +5 %. **Solo si la caché está en buffers Vulkan** (no se pudieron probar otros backends) |
 | 5 | `MUL_MAT_ID_VEC` de iq3_xxs con `k <= 512` como un único grupo de 32 hilos (wave32) | `ggml-vulkan.cpp` | kernel 65,5 → 50,8 µs (−22 %); tg MoE +2 % |
 | 6 | **Fusión C:** `CONCAT`(estado de convolución, qkv) + `SSM_CONV` + `SILU` + el `CPY` que guarda el nuevo estado de convolución, en **un solo dispatch**: el shader lee estado y qkv sin materializar el concat y escribe el estado nuevo en la caché | `ssm_conv.comp` (variante `FUSE_CONV_CPY`), `ggml-vulkan.cpp` | `CONCAT`+`CPY`+`SSM_CONV_SILU` 18,5 → 6,15 µs por capa recurrente; tg MoE +2,1 %, denso +0,4 % (ruido). Solo con 1 token por secuencia, kernel de ancho 4, F32 y sin MTP |
+| 7 | **Producto escalar entero para iq2_xs en los expertos** (`MUL_MAT_ID`, generación): nueva función `mmvq_dot_product` para `IQ2_XS` en el camino que cuantiza las activaciones a q8_1 y usa `dotPacked4x8EXT` (2 productos enteros por 8 pesos, en lugar de 8 `fma` con selección de signo); los signos se expanden a una máscara por byte y se aplican con `(grid ^ neg*0xFF) + neg` | `mul_mat_vecq_funcs.glsl`, `mul_mat_vecq.comp`, generador de shaders, `ggml-vulkan.cpp` | kernel iq2_xs (m=512, n=8, k=2048) 42,0 → 36,8 µs (−12,5 %); tg MoE +1,5 %. **Cambia la numérica** (activaciones en q8_1), sin efecto medible en calidad (ver "Calidad"). Solo se usa donde la regla de Vulkan elige este camino (AMD: `k >= 2048`, o 2 o más tokens) |
 
 Detalles y trampas:
 
@@ -210,6 +212,13 @@ Detalles y trampas:
 - Fusión C: con una suma secuencial en el shader el texto divergía a temperatura 0 por el orden de las sumas en fp32; con
   el mismo `dot` de 4 elementos que usa el kernel sin fusionar, el texto sale **idéntico** (MoE 150 tokens, denso 60).
   Es otro ejemplo de por qué conviene calcular igual que el kernel original (ver "Metodología").
+- Cambio 7: el **ajuste de filas por grupo de trabajo** (1/2/4/8 → 273/204/184/192 ms) ya estaba en su óptimo (4). El kernel
+  queda a ~65 GB/s efectivos frente a ~100 GB/s de las matmul densas, así que no está en el techo de memoria; llegar ahí
+  daría como mucho otro ~+4 % (estimación, no medida) y no he encontrado cómo. Los iq3_xxs de bajada (`k=512`) no
+  pasan la regla `k >= 2048` en generación sin MTP y no tienen camino entero.
+- Cambio 7: la comprobación habitual de perplexity con lotes de 512 **no ejercita este camino** (usa la matmul por
+  bloques, no el mat-vec), así que da el mismo valor sin importar lo que se cambie. La calidad se midió token a token
+  (`llama-perplexity -b 1 -ub 1`).
 - No hay prueba unitaria que cubra `build_rs`; la verificación es de extremo a extremo.
 
 ### 6. Lo que no funcionó (para no repetirlo)
@@ -241,6 +250,12 @@ Esta tabla se midió con los cambios 1-5. La fusión C (cambio 6) se añadió de
 perplexity y KL-divergence: perplexity 7,0841 → 7,0841, KL media ≈ 0, máximo 5,6e-5, misma predicción más probable
 100,000 %. HellaSwag y Winogrande no se repitieron con ella, y en el denso solo se comparó texto a temperatura 0.
 
+El cambio 7 (iq2_xs entero) solo afecta a la generación y se midió **token a token** (`-b 1 -ub 1`, 4 trozos de 512, MoE,
+frente al `master` limpio): perplexity 5,7172 → 5,7276 (+0,18 % ± 0,18 %, no significativo), KL media ≈ 0 (el suelo de
+ruido del fichero de referencia es ~5e-5), misma predicción más probable 100,000 %, RMS de Δp 0,001 %; el texto a
+temperatura 0 salió idéntico en 150 tokens. A diferencia de las fusiones A-C, este cambio **no es exacto bit a bit**, porque
+cuantiza las activaciones a q8_1; el efecto observado es mínimo. No se repitió con el denso, ni HellaSwag/Winogrande.
+
 Los valores mínimos de KL salen ligeramente negativos por la cuantización del fichero de referencia (ruido, no un error).
 Con 400-500 tareas el error es de ~2 puntos: estas pruebas confirman que los parches no alteran el modelo, pero **no
 distinguen** entre modelos de calidad parecida (la diferencia de 3,8 puntos en Winogrande entre el denso y el MoE está
@@ -270,7 +285,9 @@ dentro del error combinado).
   aleatorios (`test-llama-archs`), no con modelos reales. Los demás backends (CUDA, Metal…) quedan **desactivados** para
   la fusión B por no poder probarse.
 - Pruebas unitarias ejecutadas: `test-backend-ops` (`MUL_MAT_ID`, `MUL_MAT`, `GATED_DELTA_NET*`, `CPY`, `GET_ROWS`,
-  `CONCAT`, `SSM_CONV*` y el nuevo `SSM_CONV_CONCAT_CPY`) y `test-llama-archs`, todas correctas.
+  `CONCAT`, `SSM_CONV*` y el nuevo `SSM_CONV_CONCAT_CPY`) y `test-llama-archs`, todas correctas con los siete cambios.
+- **Con MTP no se midió el cambio 7:** con 2 o más tokens (verificación de MTP) Vulkan elige este camino también para iq2_xs,
+  y no he medido ni la velocidad ni la calidad en ese caso.
 - Estimaciones marcadas como tales en el texto no se midieron.
 
 ## Créditos
