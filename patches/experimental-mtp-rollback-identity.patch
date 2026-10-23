@@ -1,0 +1,639 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+index fdce443a1..3819a3225 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+@@ -702,6 +702,8 @@ struct vk_op_gated_delta_net_push_constants {
+     uint32_t neq1, rq3;
+     float scale;
+     uint32_t K;
++    uint32_t fused_cache;
++    uint32_t slot_stride;
+ };
+ 
+ struct vk_op_ssm_scan_push_constants {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index 00d20e843..2c6aecb85 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -536,6 +536,9 @@ static constexpr std::initializer_list<ggml_op> rms_norm_view_set_rows_pattern {
+ 
+ static constexpr std::initializer_list<ggml_op> rope_view_set_rows_pattern { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+ 
++// gated_delta_net, view of its state, view of the recurrent cache, cpy of the state into the cache
++static constexpr std::initializer_list<ggml_op> gated_delta_net_cpy_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
++
+ // scale_out*sigmoid(scale_in*x) as the hc_post weights (qwen4exp hc_combine)
+ static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
+ 
+@@ -625,6 +628,12 @@ enum rms_norm_mode {
+     RMS_NORM_COUNT,
+ };
+ 
++static constexpr std::initializer_list<std::array<int, 3>> gated_delta_net_cpy_edges {
++    { 1, 0, 0 }, // state view->src[0] == gated_delta_net
++    { 3, 0, 1 }, // cpy->src[0]        == state view
++    { 3, 1, 2 }, // cpy->src[1]        == cache view
++};
++
+ static constexpr std::initializer_list<std::array<int, 3>> rope_view_set_rows_edges {
+     { 1, 0, 0 }, // view->src[0]     == rope
+     { 2, 0, 1 }, // set_rows->src[0] == view
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index e603cbcb1..c69284b76 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1671,6 +1671,13 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
+ #endif
+ }
+ 
++// Whether the MUL_MAT_ID mat-vec kernels can be run as a single wave32 per workgroup. Only RDNA3 was measured.
++static bool ggml_vk_mul_mat_vec_id_wave32_capable(const vk_device& device) {
++    return device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 &&
++           device->subgroup_arithmetic && device->subgroup_size_control &&
++           device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32;
++}
++
+ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
+ 
+@@ -3012,6 +3019,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
+         }
+ 
++        // The iq3_xxs kernel handles one super-block with 16 invocations, so a wave64 covers four. With k <= 512
++        // a row has at most two, and half of the lanes idle; there the large-workgroup slot, which is not used
++        // for AMD otherwise, holds a variant with a single wave32 per workgroup (see ggml_vk_get_dequantize_mul_mat_vec_id).
++        const bool id_iq3_xxs_wave32 = w == DMMV_WG_SIZE_LARGE && ggml_vk_mul_mat_vec_id_wave32_capable(device);
++        const uint32_t id_iq3_xxs_subgroup_size = id_iq3_xxs_wave32 ? 32 : force_subgroup_size16;
++        const uint32_t id_iq3_xxs_wg_size = id_iq3_xxs_wave32 ? 32 : wg_size_subgroup16;
++        const shader_reduction_mode id_iq3_xxs_reduc = id_iq3_xxs_wave32 ? SHADER_REDUCTION_MODE_SUBGROUP : reduc16;
++
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_F32 ], "mul_mat_vec_id_f32_f32",        arr_dmmv_id_f32_f32_f32_len[reduc],     arr_dmmv_id_f32_f32_f32_data[reduc],     "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1, 1, 1}, {wg_size_subgroup, 1}, 1, false, use_subgroups, force_subgroup_size);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_F16 ], "mul_mat_vec_id_f16_f32",        arr_dmmv_id_f16_f32_f32_len[reduc],     arr_dmmv_id_f16_f32_f32_data[reduc],     "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2, 1, 1}, {wg_size_subgroup, 2}, 1, false, use_subgroups, force_subgroup_size);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_BF16], "mul_mat_vec_id_bf16_f32",       arr_dmmv_id_bf16_f32_f32_len[reduc],    arr_dmmv_id_bf16_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2, 1, 1}, {wg_size_subgroup, 2}, 1, false, use_subgroups, force_subgroup_size);
+@@ -3034,7 +3049,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ2_XXS], "mul_mat_vec_id_iq2_xxs_f32", arr_dmmv_id_iq2_xxs_f32_f32_len[reduc16], arr_dmmv_id_iq2_xxs_f32_f32_data[reduc16], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ2_XS],  "mul_mat_vec_id_iq2_xs_f32",  arr_dmmv_id_iq2_xs_f32_f32_len[reduc16],  arr_dmmv_id_iq2_xs_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ2_S],   "mul_mat_vec_id_iq2_s_f32",   arr_dmmv_id_iq2_s_f32_f32_len[reduc16],   arr_dmmv_id_iq2_s_f32_f32_data[reduc16],   "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+-        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ3_XXS], "mul_mat_vec_id_iq3_xxs_f32", arr_dmmv_id_iq3_xxs_f32_f32_len[reduc16], arr_dmmv_id_iq3_xxs_f32_f32_data[reduc16], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ3_XXS], "mul_mat_vec_id_iq3_xxs_f32", arr_dmmv_id_iq3_xxs_f32_f32_len[id_iq3_xxs_reduc], arr_dmmv_id_iq3_xxs_f32_f32_data[id_iq3_xxs_reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {id_iq3_xxs_wg_size, rm_iq}, 1, true, use_subgroups16, id_iq3_xxs_subgroup_size);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ3_S],   "mul_mat_vec_id_iq3_s_f32",   arr_dmmv_id_iq3_s_f32_f32_len[reduc16],   arr_dmmv_id_iq3_s_f32_f32_data[reduc16],   "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ4_XS],  "mul_mat_vec_id_iq4_xs_f32",  arr_dmmv_id_iq4_xs_f32_f32_len[reduc16],  arr_dmmv_id_iq4_xs_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ4_NL],  "mul_mat_vec_id_iq4_nl_f32",  arr_dmmv_id_iq4_nl_f32_f32_len[reduc16],  arr_dmmv_id_iq4_nl_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+@@ -3727,7 +3742,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+             for (uint32_t kda = 0; kda < 2; kda++) {
+                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
+-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
++                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
+                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+             }
+         }
+@@ -5716,6 +5731,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
+         }
+     }
+ 
++    // few super-blocks per row: single-wave32 variant, kept in the large workgroup slot on AMD
++    if (b_type == GGML_TYPE_F32 && a_type == GGML_TYPE_IQ3_XXS && k <= 512 && ggml_vk_mul_mat_vec_id_wave32_capable(ctx->device)) {
++        dmmv_wg = DMMV_WG_SIZE_LARGE;
++    }
++
+     if (b_type == GGML_TYPE_Q8_1) {
+         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+@@ -7436,9 +7456,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+ #endif
+     const bool can_quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 &&
+                                 ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
+-    // Intel coopmat1 matrix cores prefer f16 activations for quantized weights
++    // Intel and AMD coopmat1 matrix cores prefer f16 activations for quantized weights
+     const bool prefer_f16_b = ctx->device->coopmat_support && !ctx->device->coopmat2 &&
+-                              ctx->device->vendor_id == VK_VENDOR_ID_INTEL &&
++                              (ctx->device->vendor_id == VK_VENDOR_ID_INTEL || ctx->device->vendor_id == VK_VENDOR_ID_AMD) &&
+                               ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
+ 
+     const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
+@@ -7467,10 +7487,15 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+                                                   y_decode_vector_staging || y_needs_k_padding);
+     const bool qy_needs_dequant = y_needs_reformat;
+ 
+-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, nei1, true));
++    // Tokens are tiled per expert, so the useful tile width is the average number of rows routed to one expert.
++    // The narrower tile only paid off for tall matrices (measured on an AMD iGPU: gain at m=2048, loss at m=512).
++    const uint32_t n_per_expert = (uint32_t) std::max<uint64_t>(1, nei0 * nei1 / n_as);
++    const uint32_t n_select = ne01 >= 2048 ? n_per_expert : (uint32_t) nei1;
++
++    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, n_select, true));
+     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
+ 
+-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, nei1, aligned, true);
++    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, n_select, aligned, true);
+ 
+     const uint32_t bn = pipeline->wg_denoms[1];
+     const uint64_t max_tiles = ggml_vk_mul_mat_id_max_tiles(n_as, nei0 * nei1, bn);
+@@ -10295,7 +10320,9 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
+         pc, {n_tiles_kv, n_tiles_t, n_streams});
+ }
+ 
+-void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++// cache_dst is the recurrent cache view of a fused trailing CPY: the shader then writes the
++// state snapshots straight into it instead of the snapshot tail of dst.
++static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const ggml_tensor * cache_dst) {
+     const ggml_tensor * src_q     = dst->src[0];
+     const ggml_tensor * src_v     = dst->src[2];
+     const ggml_tensor * src_beta  = dst->src[4];
+@@ -10337,6 +10364,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
+     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
+ 
+     const float scale = 1.0f / sqrtf((float)S_v);
++    const uint32_t slot_stride = cache_dst && K > 1 ? (uint32_t)(cache_dst->nb[2] / sizeof(float)) : 0;
+     const vk_op_gated_delta_net_push_constants pc = {
+         H, n_tokens, n_seqs, s_off,
+         sq1, sq2, sq3,
+@@ -10344,14 +10372,22 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
+         sb1, sb2, sb3,
+         neq1, rq3,
+         scale,
+-        K
++        K,
++        cache_dst ? 1u : 0u, slot_stride
+     };
+ 
++    // Without the fusion, dst is bound again as a dummy cache buffer that the shader never touches.
++    vk_subbuffer cache_buf = cache_dst ? ggml_vk_tensor_subbuffer(ctx, cache_dst) : dst_buf;
++
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
++        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, cache_buf},
+         pc, { H, n_seqs, S_v });
+ }
+ 
++void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    ggml_vk_gated_delta_net(ctx, subctx, dst, nullptr);
++}
++
+ void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+@@ -12803,7 +12839,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+         break;
+ 
+     case GGML_OP_GATED_DELTA_NET:
+-        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
++        // fused GATED_DELTA_NET_CPY: the trailing CPY holds the recurrent cache view
++        ggml_vk_gated_delta_net(ctx, compute_ctx, node,
++            ctx->num_additional_fused_ops ? cgraph->nodes[node_idx + ctx->num_additional_fused_ops]->src[1] : nullptr);
+ 
+         break;
+ 
+@@ -14077,6 +14115,45 @@ bool ggml_vk_can_fuse_rope_set_rows(ggml_backend_vk_context * ctx, const struct
+     return true;
+ }
+ 
++// Fuse gated_delta_net with the cpy that copies its final state (snapshots) into the recurrent cache.
++static bool ggml_vk_can_fuse_gated_delta_net_cpy(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
++                                                 int node_idx) {
++    const ggml_tensor * gdn  = cgraph->nodes[node_idx + 0];
++    const ggml_tensor * src  = cgraph->nodes[node_idx + 1]; // view of the snapshot tail of gdn
++    const ggml_tensor * cpy  = cgraph->nodes[node_idx + 3];
++    const ggml_tensor * dst  = cpy->src[1];                 // recurrent cache view
++
++    // The shader skips the snapshot tail, so neither gdn nor the cpy may be a graph output.
++    if (gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return false;
++    }
++
++    const ggml_tensor * src_v = gdn->src[2];
++    const int64_t S_v       = src_v->ne[0];
++    const int64_t H         = src_v->ne[1];
++    const int64_t n_tokens  = src_v->ne[2];
++    const int64_t n_seqs    = src_v->ne[3];
++    const int64_t D         = S_v * S_v * H;
++    const int64_t K         = ggml_get_op_params_i32(gdn, 0);
++    const int64_t n_written = std::min<int64_t>(n_tokens, K);
++
++    // The snapshot tail starts right after the attention scores.
++    if (src->view_offs != ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs) || !ggml_is_contiguous(src)) {
++        return false;
++    }
++
++    // The cache view is [D, n_seqs, n_written] with the per-seq stride the shader assumes.
++    const int64_t expected_ne[GGML_MAX_DIMS] = { D, n_seqs, n_written, 1 };
++    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++        if (dst->ne[i] != expected_ne[i]) {
++            return false;
++        }
++    }
++    return dst->type == GGML_TYPE_F32 && dst->buffer != nullptr &&
++           dst->nb[0] == sizeof(float) && dst->nb[1] == (size_t) D * sizeof(float) &&
++           get_misalign_bytes(ctx, dst) == 0;
++}
++
+ bool ggml_vk_can_fuse_rms_norm_set_rows(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                                int node_idx) {
+     const ggml_tensor * rms = cgraph->nodes[node_idx];
+@@ -14159,6 +14236,20 @@ bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct ggml_cgr
+     return true;
+ }
+ 
++// The input state of a fused gated_delta_net + cpy may alias the first snapshot slot of the fused cache destination:
++// `state` starts at the base of `dst` and lies entirely inside slot 0 (slot stride dst->nb[2]). The kernel loads its
++// whole input state into registers before any write and each lane only writes slot 0 elements it has read, the other
++// slots live in other rollback groups of the cache.
++static bool ggml_vk_gdn_state_in_first_slot(const ggml_tensor * state, const ggml_tensor * dst) {
++    ggml_backend_vk_buffer_context * s_buf_ctx = (ggml_backend_vk_buffer_context *)state->buffer->context;
++    ggml_backend_vk_buffer_context * d_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
++    if (s_buf_ctx->dev_buffer != d_buf_ctx->dev_buffer) {
++        return false;
++    }
++    return vk_tensor_offset(state) + state->view_offs == vk_tensor_offset(dst) + dst->view_offs &&
++           ggml_nbytes(state) <= dst->nb[2];
++}
++
+ bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise) {
+     ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)a->buffer->context;
+     vk_buffer a_buf = a_buf_ctx->dev_buffer;
+@@ -14435,6 +14526,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         // the src is allowed to overlap the memory for the destination.
+         // The array is sized to handle the largest fusion (asserted later).
+         bool op_srcs_fused_elementwise[13];
++        // set when gated_delta_net is fused with the cpy writing the recurrent cache (see below)
++        bool fused_gdn_cpy = false;
+ 
+         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+         ctx->fused_topk_moe_scale = false;
+@@ -14559,6 +14652,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 op_srcs_fused_elementwise[0] = false;
+                 op_srcs_fused_elementwise[1] = false;
+                 op_srcs_fused_elementwise[2] = false;
++            } else if (ggml_can_fuse_subgraph(cgraph, i, gated_delta_net_cpy_pattern, { i, i + 2, i + 3 }) &&
++                       ggml_check_edges(cgraph, i, gated_delta_net_cpy_edges) &&
++                       ggml_vk_can_fuse_gated_delta_net_cpy(ctx, cgraph, i)) {
++                ctx->num_additional_fused_ops = 3;
++                // gated_delta_net writes its attention output to memory, the cpy writes the cache
++                ctx->fused_ops_write_mask |= 1 << 0;
++                fusion_string = "GATED_DELTA_NET_CPY";
++                fused_gdn_cpy = true;
++                std::fill_n(op_srcs_fused_elementwise, 4, false);
+             } else if (ggml_vk_can_fuse_snake(ctx, cgraph, i)) {
+                 ctx->num_additional_fused_ops = 4;
+                 fusion_string = "SNAKE";
+@@ -14660,7 +14762,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                         if (!src || src->op == GGML_OP_NONE) {
+                             continue;
+                         }
+-                        if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
++                        // The gated_delta_net kernel loads its input state (src[5]) into registers before writing
++                        // exactly the same elements of the cache, so the state may alias the cache view exactly
++                        // (the graph passes a view of the cache as the input state). Partial overlaps still disable the fusion.
++                        const bool exact_alias_ok = op_srcs_fused_elementwise[k] || (fused_gdn_cpy && k == 0 && s == 5);
++                        // with several snapshot slots the cache destination is larger than the input state, which then
++                        // aliases only its first slot
++                        const bool first_slot_alias = fused_gdn_cpy && k == 0 && s == 5 && ggml_vk_gdn_state_in_first_slot(src, dst);
++                        if (!first_slot_alias && ggml_vk_tensors_overlap(src, dst, exact_alias_ok)) {
+                             bool found = false;
+                             for (int n = 0; n < k; ++n) {
+                                 if (cgraph->nodes[i + n] == src) {
+@@ -14938,6 +15047,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+         if (keep_pattern(rope_view_set_rows_pattern)) {
+             continue;
+         }
++        if (keep_pattern(gated_delta_net_cpy_pattern)) {
++            continue;
++        }
+         if (match_pattern(hc_post_gate_pattern, first_unused)) {
+             add_pattern_alloc_deps(hc_post_gate_pattern, first_unused + (int) hc_post_gate_pattern.size() - 1);
+             keep_pattern(hc_post_gate_pattern);
+@@ -14983,6 +15095,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
+                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
+                 match_pattern(rope_view_set_rows_pattern, j) ||
++                match_pattern(gated_delta_net_cpy_pattern, j) ||
+                 match_pattern(hc_post_gate_pattern, j)) {
+                 continue;
+             }
+@@ -15137,6 +15250,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+                 if (!is_empty(graph->nodes[j])) {
+                     continue;
+                 }
++                // Keep the cache view between the gated_delta_net state view and its cpy
++                if (j >= 2 && match_pattern(gated_delta_net_cpy_pattern, j - 2)) {
++                    continue;
++                }
+                 bool ok = true;
+                 for (int c = first_unused; c < j; ++c) {
+                     bool c_in_current_set = std::find(current_set.begin(), current_set.end(), c) != current_set.end();
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+index 0e384330b..95d30c34d 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+@@ -32,6 +32,10 @@ layout(push_constant) uniform Parameters {
+     uint neq1, rq3;
+     float scale;
+     uint K;
++    // fused_cache != 0: write the state snapshots straight into the recurrent cache (data_cache)
++    // instead of the snapshot tail of data_dst; slot_stride is the cache stride between slots.
++    uint fused_cache;
++    uint slot_stride;
+ };
+ 
+ layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
+@@ -41,6 +45,7 @@ layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
+ layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
+ layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
+ layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
++layout(binding = 7)           buffer CacheBuf { FLOAT_TYPE data_cache[]; };
+ 
+ #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
+ shared FLOAT_TYPE temp[SUBGROUP_SIZE];
+@@ -174,8 +179,14 @@ void main() {
+             const int target_slot = int(n_tokens) - 1 - int(t);
+             if (target_slot >= 0 && target_slot < int(K)) {
+                 const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
++                const uint cache_base = uint(target_slot) * slot_stride + state_out_base;
+                 [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+-                    data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++                    const uint i = col * S_V + r * LANES_PER_COLUMN + lane;
++                    if (fused_cache != 0u) {
++                        data_cache[cache_base + i] = s_shard[r];
++                    } else {
++                        data_dst[slot_base + i] = s_shard[r];
++                    }
+                 }
+             }
+         }
+@@ -183,7 +194,12 @@ void main() {
+ 
+     if (K == 1u) {
+         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+-            data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++            const uint i = col * S_V + r * LANES_PER_COLUMN + lane;
++            if (fused_cache != 0u) {
++                data_cache[state_out_base + i] = s_shard[r];
++            } else {
++                data_dst[s_off + state_out_base + i] = s_shard[r];
++            }
+         }
+     }
+ }
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 2bc3a291a..d79af31b7 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -401,7 +401,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+ 
+     const int64_t n_rs = mctx->get_n_rs();
+ 
+-    if (s_copy) {
++    // s_copy has no buffer when the graph reads the states straight from the cache
++    if (s_copy && s_copy->buffer) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
+         int32_t * data = (int32_t *) s_copy->data;
+ 
+@@ -426,6 +427,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
+     res &= head == mctx->get_head();
+     res &= rs_z == mctx->get_rs_z();
+ 
++    res &= s_copy_identity == mctx->s_copy_is_identity(params.ubatch.n_seqs);
++
+     return res;
+ }
+ 
+@@ -1176,7 +1179,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+-    if (inp_rs->s_copy) {
++    // s_copy has no buffer when the graph reads the states straight from the cache
++    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+         int32_t * data = (int32_t *) inp_rs->s_copy->data;
+ 
+@@ -1206,6 +1210,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
+     res &= inp_rs->head == mctx->get_recr()->get_head();
+     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+ 
++    res &= inp_rs->s_copy_identity == mctx->get_recr()->s_copy_is_identity(params.ubatch.n_seqs);
++
+     return res;
+ }
+ 
+@@ -1219,7 +1225,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+-    if (inp_rs->s_copy) {
++    // s_copy has no buffer when the graph reads the states straight from the cache
++    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+         int32_t * data = (int32_t *) inp_rs->s_copy->data;
+ 
+@@ -1248,6 +1255,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
+     res &= inp_rs->head == mctx->get_recr()->get_head();
+     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+ 
++    res &= inp_rs->s_copy_identity == mctx->get_recr()->s_copy_is_identity(params.ubatch.n_seqs);
++
+     return res;
+ }
+ 
+@@ -1292,7 +1301,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+-    if (inp_rs->s_copy) {
++    // s_copy has no buffer when the graph reads the states straight from the cache
++    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+         int32_t * data = (int32_t *) inp_rs->s_copy->data;
+ 
+@@ -1335,6 +1345,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
+     res &= inp_rs->head == mctx->get_recr()->get_head();
+     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+ 
++    res &= inp_rs->s_copy_identity == mctx->get_recr()->s_copy_is_identity(params.ubatch.n_seqs);
++
+     return res;
+ }
+ 
+@@ -3811,7 +3823,8 @@ ggml_tensor * llm_graph_context::build_rs(
+            uint32_t   rs_head,
+            uint32_t   rs_size,
+             int32_t   rs_zero,
+-        const llm_graph_get_rows_fn & get_state_rows) const {
++        const llm_graph_get_rows_fn & get_state_rows,
++               bool   state_copy_identity) const {
+ 
+     GGML_UNUSED(rs_size);
+     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+@@ -3821,6 +3834,16 @@ ggml_tensor * llm_graph_context::build_rs(
+     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+     ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+ 
++    if (state_copy_identity) {
++        // the gather would copy row rs_head + i to row i for every state of the ubatch: use the cache rows directly
++        GGML_ASSERT(!get_state_rows && n_rs == (uint32_t) n_seqs && rs_zero < 0);
++
++        ggml_tensor * output_states = ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], (size_t) rs_head*states->nb[1]);
++        ggml_build_forward_expand(gf, output_states);
++
++        return output_states;
++    }
++
+     // copy states
+     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
+     // one gather of the states i0..n_rs (ubatch states then extra states), sized by n_rs so the reserve covers every split
+@@ -3864,6 +3887,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+     inp->head = mctx_cur->get_head();
+     inp->rs_z = mctx_cur->get_rs_z();
+ 
++    inp->s_copy_identity = mctx_cur->s_copy_is_identity(n_seqs);
++
+     return inp;
+ }
+ 
+@@ -3889,7 +3914,7 @@ ggml_tensor * llm_graph_context::build_rs(
+ 
+     return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
+                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
+-                    get_state_rows);
++                    get_state_rows, inp->s_copy_identity && !get_state_rows);
+ }
+ 
+ ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index f66bedb32..1a71b868c 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -298,6 +298,11 @@ public:
+     // used in view offsets, need to match for valid graph reuse
+     uint32_t head;
+     int32_t rs_z;
++
++    // the state gather is an identity copy (see llama_memory_recurrent_context::s_copy_is_identity()):
++    // build_rs() then reads the states straight from the cache and s_copy may not be part of the graph.
++    // Changes the graph topology, so it needs to match for valid graph reuse
++    bool s_copy_identity = false;
+ };
+ 
+ class llm_graph_input_cross_embd : public llm_graph_input_i {
+@@ -1397,7 +1402,8 @@ struct llm_graph_context {
+                uint32_t   rs_head,
+                uint32_t   rs_size,
+                 int32_t   rs_zero,
+-            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
++            const llm_graph_get_rows_fn & get_state_rows = nullptr,
++                   bool   state_copy_identity = false) const;
+ 
+     llm_graph_input_rs * build_rs_inp() const;
+ 
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 2893d819e..ec81e490e 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -125,6 +125,16 @@ llama_memory_recurrent::llama_memory_recurrent(
+         ctxs_bufs.emplace_back(std::move(ctx), buf);
+     }
+ 
++    // Reading the input state of a gated delta net straight from the cache makes it alias the cache view the
++    // fused state write-back targets. Exact in-place aliasing of the input state with the fused cache destination
++    // was only verified for the Vulkan kernel (it loads the state into registers before writing the same
++    // elements), so every other backend keeps the explicit gather.
++    state_alias_ok = !ctx_map.empty();
++    for (const auto & [buft, ctx] : ctx_map) {
++        state_alias_ok = state_alias_ok && !ggml_backend_buft_is_host(buft) &&
++                         strncmp(ggml_backend_buft_name(buft), "Vulkan", 6) == 0;
++    }
++
+     if (is_empty()) {
+         if (n_rs_seq > 0) {
+             n_rs_seq = 0;
+@@ -1324,6 +1334,8 @@ bool llama_memory_recurrent_context::apply() {
+ 
+     mem->find_slot(ubatches[i_next]);
+ 
++    mem->identity_run = s_copy_identity_possible(ubatches[i_next].n_seqs) ? mem->identity_run + 1 : 0;
++
+     return true;
+ }
+ 
+@@ -1365,6 +1377,43 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
+     return mem->p_l[il];
+ }
+ 
++bool llama_memory_recurrent_context::s_copy_is_identity(uint32_t n_seqs) const {
++    // A graph that skips the gather has a different topology, so every switch between the two forms costs a graph
++    // rebuild (a few ms, more than the ~1.5 ms the skipped gathers take). The gather has to run in every ubatch that
++    // follows a rollback, so only skip it once several previous ubatches could have skipped it too: the rebuilds of
++    // a short run lose more than the run saves.
++    constexpr uint32_t min_run = 4;
++
++    return mem->identity_run > min_run && s_copy_identity_possible(n_seqs);
++}
++
++bool llama_memory_recurrent_context::s_copy_identity_possible(uint32_t n_seqs) const {
++    // the reserve graph, cleared states (rs_z >= 0) and extra cells between the ubatch states and n_rs
++    // all need the regular gather
++    if (is_full || !mem->state_alias_ok || mem->rs_z >= 0 || mem->n != n_seqs) {
++        return false;
++    }
++
++    for (uint32_t i = 0; i < n_seqs; ++i) {
++        const uint32_t cell_idx = mem->head + i;
++        const auto &   cell     = mem->cells[cell_idx];
++        if (cell.src0 != (int32_t) cell_idx) {
++            return false;
++        }
++
++        // a pending rollback makes s_copy() read the state from a snapshot group instead of the newest one
++        // (mirrors the lookup of s_copy(), but does not consume the rollback index)
++        if (mem->n_rs_seq != 0 && !cell.seq_id.empty()) {
++            const llama_seq_id seq = *cell.seq_id.begin();
++            if (seq >= 0 && (size_t) seq < mem->rs_idx.size() && mem->rs_idx[seq] != 0) {
++                return false;
++            }
++        }
++    }
++
++    return true;
++}
++
+ int32_t llama_memory_recurrent_context::s_copy(int i) const {
+     const uint32_t cell_idx = i + mem->head;
+     const int32_t  src0     = mem->cells[cell_idx].src0;
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index 08489a4be..7294e9212 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -84,6 +84,14 @@ public:
+     // first zero-ed state
+     int32_t rs_z = -1;
+ 
++    // number of consecutive ubatches (counted when their memory context is applied) for which the state gather could
++    // be skipped, see llama_memory_recurrent_context::s_copy_is_identity()
++    uint32_t identity_run = 0;
++
++    // true when every state tensor lives in a Vulkan device buffer: only then may the graph read the state of a
++    // ubatch straight from the cache (see llama_memory_recurrent_context::s_copy_is_identity())
++    bool state_alias_ok = false;
++
+     // TODO: optimize for recurrent state needs
+     struct mem_cell {
+         llama_pos pos  = -1;
+@@ -182,6 +190,16 @@ public:
+ 
+     int32_t s_copy(int i) const;
+ 
++    // true when the states of the ubatch (n_seqs sequences) are exactly the cells head..head+n_seqs-1, i.e. the
++    // state gather driven by s_copy() would be an identity copy and the graph can use the cache rows directly.
++    // With rollback (n_rs_seq > 0) this also requires that no sequence of the ubatch has a pending rollback, so it
++    // has to be evaluated for a ubatch before llm_graph_input_rs::set_input() consumes the rollback indices.
++    // Has no side effects (unlike s_copy()).
++    bool s_copy_is_identity(uint32_t n_seqs) const;
++
++    // the gather could be skipped for this ubatch (s_copy_is_identity() additionally waits for a stable run)
++    bool s_copy_identity_possible(uint32_t n_seqs) const;
++
+ private:
+     const llama_memory_status status;
+ 
