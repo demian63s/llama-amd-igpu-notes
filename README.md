@@ -75,6 +75,7 @@ modelo. Resultados frente a un `master` limpio, medidos de forma intercalada el 
 | MoE, con el cambio 6 (fusión C, añadida después; frente al mismo binario sin ella) | otro **+2,1 %** (36,8 → 37,5 t/s) | sin cambio |
 | Denso 27B, con el cambio 6 | +0,4 % (dentro del ruido) | n/a |
 | MoE, con el cambio 7 (producto entero para iq2_xs; frente al mismo binario sin él) | otro **+1,5 %** (37,15 → 37,71 t/s) | sin cambio |
+| MoE con MTP y el cambio 7 (`llama-server`, 3 rondas intercaladas, 3 prompts de 200 tokens) | `n-max 1`: **+3,5 %** (42,5 → 44,0 t/s); `n-max 2`: **+3,0 %** (44,9 → 46,3 t/s); sin MTP en el mismo test +1,4 % | n/a |
 
 El 20-oct, con la máquina más rápida, el conjunto dio ~+10 % de generación sin MTP y +11-12 % de prompt en el MoE.
 Con MTP la ganancia de los parches es menor (+4,4 % medido con MoE, `n-max 1`).
@@ -286,8 +287,11 @@ dentro del error combinado).
   la fusión B por no poder probarse.
 - Pruebas unitarias ejecutadas: `test-backend-ops` (`MUL_MAT_ID`, `MUL_MAT`, `GATED_DELTA_NET*`, `CPY`, `GET_ROWS`,
   `CONCAT`, `SSM_CONV*` y el nuevo `SSM_CONV_CONCAT_CPY`) y `test-llama-archs`, todas correctas con los siete cambios.
-- **Con MTP no se midió el cambio 7:** con 2 o más tokens (verificación de MTP) Vulkan elige este camino también para iq2_xs,
-  y no he medido ni la velocidad ni la calidad en ese caso.
+- **Cambio 7 con MTP (solo MoE):** se midió la velocidad (tabla de arriba). La aceptación de borradores no cambia de forma
+  apreciable (`n-max 1`: 84,2 % → 86,0 %; `n-max 2`: 76,1 % → 75,7 %). El texto a temperatura 0 diverge en algunos prompts
+  entre activar y desactivar el cambio (primer carácter distinto entre el 138 y el 1156), igual que diverge entre MTP y sin
+  MTP con el mismo código: es el ruido numérico recurrente que describe "Metodología", no se midió KL con MTP. No se midió
+  en el denso.
 - Estimaciones marcadas como tales en el texto no se midieron.
 
 ## Créditos
