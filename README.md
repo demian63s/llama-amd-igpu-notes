@@ -307,6 +307,40 @@ dentro del error combinado).
 - **ROCm/HIP:** Ubuntu 26.04 trae ROCm 7.1 y se instalaron los paquetes, pero **la prueba no se llegó a ejecutar**; el
   soporte oficial de gfx1152 (Krackan) no está confirmado y la evidencia externa favorece a Vulkan en generación.
 
+### 10. Otra cuantización: expertos k-quant y el cambio 9 (propuesto, no implementado)
+
+Hipótesis: los expertos IQ (iq2_xs, iq3_xxs) están limitados por cálculo en esta GPU, así que un fichero con expertos
+k-quant, que usan el camino entero (MMVQ), podría generar más rápido. Se probó `bartowski/Qwen_Qwen3.6-35B-A3B-GGUF`
+`Q2_K` (12,6 GiB): todos los expertos en q2_K/q3_K, ningún IQ, y **con cabeza MTP** (otros Q2_K, como el `i1-Q2_K` de
+mradermacher, no la tienen). Antes de descargarlos se miraron los tipos de los tensores leyendo solo la cabecera GGUF.
+Medido con los cambios 1-8 frente al `UD-Q2_K_XL` de unsloth:
+
+| | bartowski `Q2_K` | unsloth `UD-Q2_K_XL` |
+|---|---|---|
+| Tamaño | 12,6 GiB | 11,7 GiB |
+| tg128 (3 rondas intercaladas) | 34,9 t/s (−9,5 %) | 38,6 t/s |
+| pp512 | 324 t/s | 323 t/s |
+| Con MTP `n-max 1` / `n-max 2` (`llama-server`, 3 prompts, sin intercalar) | 46,7 / 50,0 t/s (acepta 87 / 85 %) | 47,0 / 49,9 t/s (86 / 76 %) |
+| Perplexity WikiText-2 (20 trozos de 512) | 7,343 (+3,7 %) | 7,084 |
+| HellaSwag (400 tareas) | 80,25 % | 80,75 % (dentro del error) |
+
+**Conclusión: el `UD-Q2_K_XL` sigue siendo la mejor opción** (más pequeño, mejor calidad, más rápido sin MTP e igual con MTP).
+
+El perfil explica por qué la hipótesis falló:
+- **Gate/up** (k=2048): q2_K 36,3 µs por llamada frente a 34,1 µs de iq2_xs. Con los cambios 7 y 8 los IQ ya rinden igual.
+- **Down** (m=2048, **k=512**): q3_K 157 µs y q2_K 115 µs frente a 51 µs de iq3_xxs. La regla de Vulkan solo elige el
+  camino entero en AMD con `k >= 2048` o con 2 o más tokens. Con un token y k=512 los k-quant van por el mat-vec que
+  descuantiza, que con tan pocos bloques por fila deja muchos hilos ociosos (~23 GB/s efectivos con q3_K).
+- La cabeza de salida es q6_K en bartowski (4,3 ms por token) y q4_K en unsloth (2,8 ms).
+
+**Cambio 9 (propuesto):** con `GGML_VK_FORCE_MMVQ=1`, que ya existe y obliga a usar el camino entero, el down baja a
+70 µs (q3_K) y 47 µs (q2_K), y el `Q2_K` pasa de 34,9 a **38,9 t/s (+11 %)**, un 1,7 % por encima del `UD-Q2_K_XL`. Al
+`UD-Q2_K_XL` forzarlo no le cambia nada (38,2 t/s), porque sus expertos down son iq3_xxs, que no tiene camino entero.
+La propuesta es que la regla de selección (`ggml_vk_should_use_mmvq`) use el camino entero en `MUL_MAT_ID` para los
+k-quant aunque `k < 2048` en AMD. Ayudaría a cualquier MoE con expertos k-quant y FFN de experto pequeña, pero **no
+está en el parche**: falta medir en qué tipos y tamaños gana y si empeora algún caso denso (la variable de entorno afecta
+a todos los mat-vec). Mientras tanto, quien use un MoE con expertos k-quant en una GPU AMD puede probar la variable.
+
 ## Limitaciones
 
 - Un solo equipo, un solo controlador (RADV 26.0.8), dos modelos de la misma familia. Los números absolutos dependen del
