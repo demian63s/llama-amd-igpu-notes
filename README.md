@@ -80,8 +80,11 @@ modelo. Resultados frente a un `master` limpio, medidos de forma intercalada el 
 El 20-oct, con la máquina más rápida, el conjunto dio ~+10 % de generación sin MTP y +11-12 % de prompt en el MoE.
 Con MTP la ganancia de los parches es menor (+4,4 % medido con MoE, `n-max 1`).
 
-**3. Calidad: no cambia.** Perplexity, KL-divergence, HellaSwag y Winogrande son iguales entre un `master` limpio y los
-parches (tabla más abajo).
+**3. Calidad: igual con lotes grandes; en generación hay diferencias de redondeo.** Con la medición habitual (lotes de
+512 tokens: perplexity, KL-divergence, HellaSwag y Winogrande) los resultados son iguales a los de un `master` limpio
+(tabla más abajo). En **generación token a token** los parches 1-7 dan diferencias de redondeo del mismo tamaño que
+desactivar las fusiones en un llama.cpp sin modificar (KL media ~5e-3, misma predicción más probable 97-98 %): ver
+"Calidad".
 
 ## Cómo reproducirlo
 
@@ -197,7 +200,7 @@ tokens cuesta ~1,39× un token (los expertos pasan de ~6,3 a ~10,6 ms) y el paso
 | 4 | **Fusión B:** si la copia de estado (`GET_ROWS`) es una identidad (una secuencia, sin reversión, sin estado nuevo), `build_rs` devuelve una **vista** de la caché | `llama-graph.cpp`, `llama-memory-recurrent.cpp` | `GET_ROWS` 62 → 2 por token; tg +5 %. **Solo si la caché está en buffers Vulkan** (no se pudieron probar otros backends) |
 | 5 | `MUL_MAT_ID_VEC` de iq3_xxs con `k <= 512` como un único grupo de 32 hilos (wave32) | `ggml-vulkan.cpp` | kernel 65,5 → 50,8 µs (−22 %); tg MoE +2 % |
 | 6 | **Fusión C:** `CONCAT`(estado de convolución, qkv) + `SSM_CONV` + `SILU` + el `CPY` que guarda el nuevo estado de convolución, en **un solo dispatch**: el shader lee estado y qkv sin materializar el concat y escribe el estado nuevo en la caché | `ssm_conv.comp` (variante `FUSE_CONV_CPY`), `ggml-vulkan.cpp` | `CONCAT`+`CPY`+`SSM_CONV_SILU` 18,5 → 6,15 µs por capa recurrente; tg MoE +2,1 %, denso +0,4 % (ruido). Solo con 1 token por secuencia, kernel de ancho 4, F32 y sin MTP |
-| 7 | **Producto escalar entero para iq2_xs en los expertos** (`MUL_MAT_ID`, generación): nueva función `mmvq_dot_product` para `IQ2_XS` en el camino que cuantiza las activaciones a q8_1 y usa `dotPacked4x8EXT` (2 productos enteros por 8 pesos, en lugar de 8 `fma` con selección de signo); los signos se expanden a una máscara por byte y se aplican con `(grid ^ neg*0xFF) + neg` | `mul_mat_vecq_funcs.glsl`, `mul_mat_vecq.comp`, generador de shaders, `ggml-vulkan.cpp` | kernel iq2_xs (m=512, n=8, k=2048) 42,0 → 36,8 µs (−12,5 %); tg MoE +1,5 %. **Cambia la numérica** (activaciones en q8_1), sin efecto medible en calidad (ver "Calidad"). Solo se usa donde la regla de Vulkan elige este camino (AMD: `k >= 2048`, o 2 o más tokens) |
+| 7 | **Producto escalar entero para iq2_xs en los expertos** (`MUL_MAT_ID`, generación): nueva función `mmvq_dot_product` para `IQ2_XS` en el camino que cuantiza las activaciones a q8_1 y usa `dotPacked4x8EXT` (2 productos enteros por 8 pesos, en lugar de 8 `fma` con selección de signo); los signos se expanden a una máscara por byte y se aplican con `(grid ^ neg*0xFF) + neg` | `mul_mat_vecq_funcs.glsl`, `mul_mat_vecq.comp`, generador de shaders, `ggml-vulkan.cpp` | kernel iq2_xs (m=512, n=8, k=2048) 42,0 → 36,8 µs (−12,5 %); tg MoE +1,5 %. **Cambia la numérica** (activaciones en q8_1); en generación las diferencias son del tamaño del ruido propio del modelo (ver "Calidad"). Solo se usa donde la regla de Vulkan elige este camino (AMD: `k >= 2048`, o 2 o más tokens) |
 
 Detalles y trampas:
 
@@ -219,7 +222,7 @@ Detalles y trampas:
   pasan la regla `k >= 2048` en generación sin MTP y no tienen camino entero.
 - Cambio 7: la comprobación habitual de perplexity con lotes de 512 **no ejercita este camino** (usa la matmul por
   bloques, no el mat-vec), así que da el mismo valor sin importar lo que se cambie. La calidad se midió token a token
-  (`llama-perplexity -b 1 -ub 1`).
+  (`llama-perplexity -b 1 -ub 1`) y, para la referencia, con las bibliotecas del original (ver "Calidad").
 - No hay prueba unitaria que cubra `build_rs`; la verificación es de extremo a extremo.
 
 ### 6. Lo que no funcionó (para no repetirlo)
@@ -247,15 +250,27 @@ Detalles y trampas:
 | HellaSwag (400 tareas) | 80,75 % → 80,75 % | 81,00 % → 81,00 % |
 | Winogrande (500 tareas) | 73,20 ± 1,98 → igual | 77,00 ± 1,88 → igual |
 
-Esta tabla se midió con los cambios 1-5. La fusión C (cambio 6) se añadió después y solo se volvió a medir en el MoE,
-perplexity y KL-divergence: perplexity 7,0841 → 7,0841, KL media ≈ 0, máximo 5,6e-5, misma predicción más probable
-100,000 %. HellaSwag y Winogrande no se repitieron con ella, y en el denso solo se comparó texto a temperatura 0.
+Esta tabla se midió con los cambios 1-5 y con lotes de 512 tokens (el camino de procesamiento de prompt).
 
-El cambio 7 (iq2_xs entero) solo afecta a la generación y se midió **token a token** (`-b 1 -ub 1`, 4 trozos de 512, MoE,
-frente al `master` limpio): perplexity 5,7172 → 5,7276 (+0,18 % ± 0,18 %, no significativo), KL media ≈ 0 (el suelo de
-ruido del fichero de referencia es ~5e-5), misma predicción más probable 100,000 %, RMS de Δp 0,001 %; el texto a
-temperatura 0 salió idéntico en 150 tokens. A diferencia de las fusiones A-C, este cambio **no es exacto bit a bit**, porque
-cuantiza las activaciones a q8_1; el efecto observado es mínimo. No se repitió con el denso, ni HellaSwag/Winogrande.
+**Corrección (24-oct):** las medidas de calidad de la fusión C y del cambio 7 que publiqué antes eran inválidas: la
+"referencia limpia" era una copia del binario original que, por tener la ruta de bibliotecas (`RUNPATH`) fijada a mi
+carpeta de compilación, cargaba **las bibliotecas modificadas**, es decir, comparaba el código nuevo consigo mismo. Hay que
+ejecutar las copias con `LD_LIBRARY_PATH=<su carpeta>` y comprobarlo con `ldd`. Repetido con una referencia realmente
+limpia (`9df0b73c7` con sus propias bibliotecas), MoE, contexto de 512:
+
+| Caso | PPL referencia | PPL candidato | KL media | KL máx. | Misma predicción | RMS de Δp |
+|---|---|---|---|---|---|---|
+| Parches 1-7, lotes de 512 (20 trozos) | 7,0841 | 7,0841 | ≈ 0 | 5,6e-5 | 100,000 % | 0,001 % |
+| Parches 1-7, token a token (`-b 1 -ub 1`, 4 trozos) | 5,7092 | 5,7276 (+0,32 %) | 5,2e-3 | 0,51 | 97,8 % | 2,2 % |
+| *Calibración:* `master` limpio con `GGML_VK_DISABLE_FUSION=1`, lotes de 512 | 7,0841 | 7,0788 | 5,3e-3 | 1,81 | 96,7 % | n/d |
+| *Calibración:* `master` limpio con `GGML_VK_DISABLE_FUSION=1`, token a token | 5,7092 | 5,7140 | 4,3e-3 | 0,24 | 97,7 % | n/d |
+
+Lectura: con lotes de 512 los parches 1-7 son **exactos** (idénticos al original). En generación token a token **no** lo
+son: la KL media es ~5e-3 y la predicción más probable cambia en ~2 % de los tokens, igual que cuando solo se desactivan
+las fusiones en el llama.cpp original (4-5e-3, 97-98 %). Es la sensibilidad numérica propia de este modelo (la
+recurrencia amplifica el orden de las sumas), no un efecto de un cambio concreto; la perplexity cambia +0,3 % con una
+incertidumbre de ~0,4 puntos. Lo que dije antes ("KL ≈ 0", "100 %" en generación) era falso. No se atribuyó la diferencia a
+un cambio concreto, ni se repitió con el denso ni con HellaSwag/Winogrande.
 
 Los valores mínimos de KL salen ligeramente negativos por la cuantización del fichero de referencia (ruido, no un error).
 Con 400-500 tareas el error es de ~2 puntos: estas pruebas confirman que los parches no alteran el modelo, pero **no
