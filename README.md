@@ -76,13 +76,14 @@ modelo. Resultados frente a un `master` limpio, medidos de forma intercalada el 
 | Denso 27B, con el cambio 6 | +0,4 % (dentro del ruido) | n/a |
 | MoE, con el cambio 7 (producto entero para iq2_xs; frente al mismo binario sin él) | otro **+1,5 %** (37,15 → 37,71 t/s) | sin cambio |
 | MoE con MTP y el cambio 7 (`llama-server`, 3 rondas intercaladas, 3 prompts de 200 tokens) | `n-max 1`: **+3,5 %** (42,5 → 44,0 t/s); `n-max 2`: **+3,0 %** (44,9 → 46,3 t/s); sin MTP en el mismo test +1,4 % | n/a |
+| MoE, con el cambio 8 (4 grupos de filas por grupo de trabajo en iq2_xs; frente al cambio 7, 3 rondas intercaladas) | otro **+0,7 %** (37,73 → 38,00 t/s) | sin cambio |
 
 El 20-oct, con la máquina más rápida, el conjunto dio ~+10 % de generación sin MTP y +11-12 % de prompt en el MoE.
 Con MTP la ganancia de los parches es menor (+4,4 % medido con MoE, `n-max 1`).
 
 **3. Calidad: igual con lotes grandes; en generación hay diferencias de redondeo.** Con la medición habitual (lotes de
 512 tokens: perplexity, KL-divergence, HellaSwag y Winogrande) los resultados son iguales a los de un `master` limpio
-(tabla más abajo). En **generación token a token** los parches 1-7 dan diferencias de redondeo del mismo tamaño que
+(tabla más abajo). En **generación token a token** los parches 1-8 dan diferencias de redondeo del mismo tamaño que
 desactivar las fusiones en un llama.cpp sin modificar (KL media ~5e-3, misma predicción más probable 97-98 %): ver
 "Calidad".
 
@@ -99,7 +100,7 @@ cmake --build build -j
 
 El parche se verificó con `git apply --check` sobre un `9df0b73c7` limpio. En commits posteriores puede necesitar ajustes.
 `patches/experimental-mtp-rollback-identity.patch` es el mismo conjunto **más** un experimento descartado (ver
-"Lo que no funcionó"); no lo recomiendo. Ese parche **no incluye los cambios 6 y 7** (fusión C e iq2_xs entero): es el
+"Lo que no funcionó"); no lo recomiendo. Ese parche **no incluye los cambios 6, 7 y 8** (fusión C e iq2_xs entero): es el
 conjunto anterior, y aplicar los dos a la vez no está probado.
 
 Scripts en `scripts/` (todos parametrizados con variables de entorno, sin rutas personales):
@@ -201,6 +202,7 @@ tokens cuesta ~1,39× un token (los expertos pasan de ~6,3 a ~10,6 ms) y el paso
 | 5 | `MUL_MAT_ID_VEC` de iq3_xxs con `k <= 512` como un único grupo de 32 hilos (wave32) | `ggml-vulkan.cpp` | kernel 65,5 → 50,8 µs (−22 %); tg MoE +2 % |
 | 6 | **Fusión C:** `CONCAT`(estado de convolución, qkv) + `SSM_CONV` + `SILU` + el `CPY` que guarda el nuevo estado de convolución, en **un solo dispatch**: el shader lee estado y qkv sin materializar el concat y escribe el estado nuevo en la caché | `ssm_conv.comp` (variante `FUSE_CONV_CPY`), `ggml-vulkan.cpp` | `CONCAT`+`CPY`+`SSM_CONV_SILU` 18,5 → 6,15 µs por capa recurrente; tg MoE +2,1 %, denso +0,4 % (ruido). Solo con 1 token por secuencia, kernel de ancho 4, F32 y sin MTP |
 | 7 | **Producto escalar entero para iq2_xs en los expertos** (`MUL_MAT_ID`, generación): nueva función `mmvq_dot_product` para `IQ2_XS` en el camino que cuantiza las activaciones a q8_1 y usa `dotPacked4x8EXT` (2 productos enteros por 8 pesos, en lugar de 8 `fma` con selección de signo); los signos se expanden a una máscara por byte y se aplican con `(grid ^ neg*0xFF) + neg` | `mul_mat_vecq_funcs.glsl`, `mul_mat_vecq.comp`, generador de shaders, `ggml-vulkan.cpp` | kernel iq2_xs (m=512, n=8, k=2048) 42,0 → 36,8 µs (−12,5 %); tg MoE +1,5 %. **Cambia la numérica** (activaciones en q8_1); en generación las diferencias son del tamaño del ruido propio del modelo (ver "Calidad"). Solo se usa donde la regla de Vulkan elige este camino (AMD: `k >= 2048`, o 2 o más tokens) |
+| 8 | En el producto entero de iq2_xs (cambio 7), cada grupo de trabajo calcula **4 grupos de 4 filas uno tras otro** en lugar de uno: se lanzan 4 veces menos grupos y la rejilla de 4 KB se copia a memoria local 4 veces menos. Es una constante de especialización (`ROW_GROUPS`, por defecto 1) que el host pone a 4 solo en iGPU AMD RDNA3/4 | `mul_mat_vecq.comp`, `ggml-vulkan.cpp`, `test-backend-ops.cpp` | kernel iq2_xs 36,5 → 34,3 µs (−7 %); tg MoE +0,7 %. **Resultado idéntico bit a bit** al cambio 7 (cada fila se calcula igual) |
 
 Detalles y trampas:
 
@@ -223,6 +225,13 @@ Detalles y trampas:
 - Cambio 7: la comprobación habitual de perplexity con lotes de 512 **no ejercita este camino** (usa la matmul por
   bloques, no el mat-vec), así que da el mismo valor sin importar lo que se cambie. La calidad se midió token a token
   (`llama-perplexity -b 1 -ub 1`) y, para la referencia, con las bibliotecas del original (ver "Calidad").
+- Cambio 8: sin la copia de la rejilla a memoria local (versión incorrecta, solo para cronometrar) el kernel baja a 31,9 µs:
+  la copia cuesta ~5 µs de ~36. Agrupar filas lo reduce en parte. Con 2 grupos no cambia nada, 4 es el óptimo y 8 empeora:
+  con m=512 y 8 expertos, 4 grupos dejan 256 grupos de trabajo por llamada, que encaja con los 8 CU de esta iGPU. En una
+  GPU grande dejaría unidades ociosas, por eso solo se activa en iGPU (`uma`); no se probó en otras GPU.
+- Cambio 8: los casos de iq2_xs que ya tenía `test-backend-ops` (`k <= 768`) **no pasan por el producto entero** en AMD;
+  se añadieron 6 con `k = 2048` (m = 512/200/203, 1 y 2 tokens), que sí fallan si se rompe el reparto de filas a propósito.
+  Comprobado además: perplexity token a token idéntica a la del cambio 7 (5,7276) y texto a temperatura 0 idéntico byte a byte.
 - No hay prueba unitaria que cubra `build_rs`; la verificación es de extremo a extremo.
 
 ### 6. Lo que no funcionó (para no repetirlo)
@@ -231,6 +240,11 @@ Detalles y trampas:
 - **wave32 en iq2_xs** o en iq3_xxs con `k >= 1024`: peor. **Tabla de rejilla en f16 en memoria local:** 1,8× más lento.
 - Diagnóstico: iq2_xs, iq3_xxs (con k=2048) e iq3_s están **limitados por cálculo, no por memoria** (~80 operaciones de
   vector por cada 16 pesos). Llegar a 90-100 GB/s exigiría un shader nuevo con producto escalar entero (q8_1).
+- **Afinar el producto entero de iq2_xs** (cambio 7), además de lo que quedó como cambio 8. Kernel de referencia ~36,5 µs:
+  escalas combinadas en enteros, sin cambio; rejilla leída de un array constante en vez de memoria local, ~16 100 µs (RADV
+  la materializa por invocación); wave32, ~43 µs; tabla de 128 máscaras de signo en memoria local, ~38,6 µs; rejilla de
+  2 bits por peso (1 KB) decodificada con aritmética, ~50 µs. Lección: en este kernel cuesta tanto la ALU como cada lectura
+  extra de memoria local.
 - **El control "sin int-dot"** (`GGML_VK_DISABLE_INTEGER_DOT_PRODUCT`) no cambió nada, así que la ausencia de camino
   int8 no explicaba la lentitud de los expertos.
 - **Atajo de identidad también con MTP** (`patches/experimental-mtp-rollback-identity.patch`): funciona y es exacto
@@ -301,7 +315,8 @@ dentro del error combinado).
   aleatorios (`test-llama-archs`), no con modelos reales. Los demás backends (CUDA, Metal…) quedan **desactivados** para
   la fusión B por no poder probarse.
 - Pruebas unitarias ejecutadas: `test-backend-ops` (`MUL_MAT_ID`, `MUL_MAT`, `GATED_DELTA_NET*`, `CPY`, `GET_ROWS`,
-  `CONCAT`, `SSM_CONV*` y el nuevo `SSM_CONV_CONCAT_CPY`) y `test-llama-archs`, todas correctas con los siete cambios.
+  `CONCAT`, `SSM_CONV*` y el nuevo `SSM_CONV_CONCAT_CPY`) y `test-llama-archs`, todas correctas con los ocho cambios.
+- **Cambio 8** no se midió con MTP ni en el denso (el denso no tiene expertos, así que no le afecta).
 - **Cambio 7 con MTP (solo MoE):** se midió la velocidad (tabla de arriba). La aceptación de borradores no cambia de forma
   apreciable (`n-max 1`: 84,2 % → 86,0 %; `n-max 2`: 76,1 % → 75,7 %). El texto a temperatura 0 diverge en algunos prompts
   entre activar y desactivar el cambio (primer carácter distinto entre el 138 y el 1156), igual que diverge entre MTP y sin
